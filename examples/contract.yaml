@@ -1,0 +1,30 @@
+dataset_id: users.daily_active
+version: "1.0.0"
+description: "One row per (user, day) for active users on the consumer plan."
+status: active
+primary_key:
+  - user_id
+  - active_date
+owners:
+  - team: growth-platform
+    contact: "#growth-platform"
+freshness_sla:
+  max_lag_seconds: 86400   # one day
+  measurement: event_time
+fields:
+  - name: user_id
+    type: string
+    description: "Subject identifier — stable across signups."
+  - name: active_date
+    type: timestamp
+    description: "UTC midnight of the day the user was active."
+  - name: plan
+    type: string
+    enum: [free, pro, enterprise]
+  - name: country
+    type: string
+  - name: ltv
+    type: number
+    required: false
+  - name: session_count
+    type: integer
