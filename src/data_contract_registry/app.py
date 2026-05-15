@@ -20,10 +20,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, ValidationError
 
-from . import __version__
+from . import __version__, audit_stream
 from .compatibility import CompatibilityMode
 from .from_decision_card import contract_owner_from_decision_card
 from .models import CompatibilityReport, DataContract, Owner
@@ -42,10 +43,15 @@ class _DeprecateRequest(BaseModel):
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.registry = ContractRegistry()
+    # Shared httpx client for best-effort audit-stream emission. Always
+    # created; the audit_stream module no-ops when AUDIT_STREAM_URL is unset.
+    app.state.http_client = httpx.AsyncClient(
+        headers={"User-Agent": f"data-contract-registry/{__version__} (+https://kineticgain.com)"},
+    )
     try:
         yield
     finally:
-        pass
+        await app.state.http_client.aclose()
 
 
 app = FastAPI(
@@ -65,6 +71,13 @@ def _registry() -> ContractRegistry:
     registry = app.state.registry
     assert isinstance(registry, ContractRegistry)
     return registry
+
+
+def _http_client() -> httpx.AsyncClient:
+    """Shared httpx client used by audit_stream.emit (best-effort)."""
+    client = app.state.http_client
+    assert isinstance(client, httpx.AsyncClient)
+    return client
 
 
 @app.get("/", tags=["meta"])
@@ -110,6 +123,17 @@ async def register_contract(req: _RegisterRequest) -> dict[str, Any]:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err)) from err
 
     if not report.compatible:
+        await audit_stream.emit(
+            _http_client(),
+            kind="contract_compatibility_failed",
+            payload={
+                "dataset_id": req.contract.dataset_id,
+                "version": req.contract.version,
+                "mode": report.mode,
+                "issue_count": len(report.issues),
+                "issues": [i.model_dump(mode="json") for i in report.issues],
+            },
+        )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
@@ -118,6 +142,16 @@ async def register_contract(req: _RegisterRequest) -> dict[str, Any]:
                 "issues": [i.model_dump(mode="json") for i in report.issues],
             },
         )
+    await audit_stream.emit(
+        _http_client(),
+        kind="contract_promoted",
+        payload={
+            "dataset_id": req.contract.dataset_id,
+            "version": req.contract.version,
+            "mode": report.mode,
+            "owners": [o.team for o in req.contract.owners],
+        },
+    )
     return {
         "status": "registered",
         "dataset_id": req.contract.dataset_id,
@@ -162,9 +196,19 @@ async def deprecate_version(
     req: _DeprecateRequest,
 ) -> DataContract:
     try:
-        return _registry().deprecate(dataset_id, version, deprecation_uri=req.deprecation_uri)
+        contract = _registry().deprecate(dataset_id, version, deprecation_uri=req.deprecation_uri)
     except RegistryError as err:
         raise HTTPException(status_code=404, detail=str(err)) from err
+    await audit_stream.emit(
+        _http_client(),
+        kind="contract_deprecated",
+        payload={
+            "dataset_id": dataset_id,
+            "version": version,
+            "deprecation_uri": req.deprecation_uri,
+        },
+    )
+    return contract
 
 
 @app.post("/contracts/{dataset_id}/versions/{version}/archive", tags=["contracts"])

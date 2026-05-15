@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Iterator
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -11,7 +14,7 @@ from data_contract_registry.app import app
 
 
 @pytest.fixture
-def client() -> TestClient:
+def client() -> Iterator[TestClient]:
     with TestClient(app) as c:
         yield c
 
@@ -159,3 +162,90 @@ class TestBridge:
     def test_owners_from_invalid_card_400(self, client: TestClient) -> None:
         r = client.post("/contracts/owners/from-decision-card", json={"no": "buyer"})
         assert r.status_code == 400
+
+
+class TestAuditStreamWiring:
+    """The three endpoints that emit governance events must do so when
+    AUDIT_STREAM_URL is set, and stay silent when it isn't."""
+
+    def _emit_capture(self, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, list[dict[str, Any]]]:
+        monkeypatch.setenv("AUDIT_STREAM_URL", "http://audit.local")
+        captured: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(201, json={"event_id": len(captured)})
+
+        c = TestClient(app)
+        c.__enter__()
+        app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return c, captured
+
+    def test_register_emits_contract_promoted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        c, captured = self._emit_capture(monkeypatch)
+        try:
+            r = c.post("/contracts", json={"contract": _contract()})
+            assert r.status_code == 201
+        finally:
+            c.__exit__(None, None, None)
+        assert any(e["kind"] == "contract_promoted" for e in captured)
+        evt = next(e for e in captured if e["kind"] == "contract_promoted")
+        assert evt["source"] == "data-contract-registry"
+        assert evt["payload"]["dataset_id"] == "users.daily_active"
+        assert evt["payload"]["version"] == "1.0.0"
+        assert "growth-platform" in evt["payload"]["owners"]
+
+    def test_incompatible_register_emits_compatibility_failed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        c, captured = self._emit_capture(monkeypatch)
+        try:
+            # First, register a baseline.
+            c.post("/contracts", json={"contract": _contract(version="1.0.0")})
+            captured.clear()
+            # Now try to ship a breaking change (drop a field).
+            new_fields = [f for f in _contract()["fields"] if f["name"] != "ltv"]
+            r = c.post(
+                "/contracts",
+                json={"contract": _contract(version="2.0.0", fields=new_fields)},
+            )
+            assert r.status_code == 422
+        finally:
+            c.__exit__(None, None, None)
+        assert any(e["kind"] == "contract_compatibility_failed" for e in captured)
+        evt = next(e for e in captured if e["kind"] == "contract_compatibility_failed")
+        assert evt["payload"]["dataset_id"] == "users.daily_active"
+        assert evt["payload"]["version"] == "2.0.0"
+        assert evt["payload"]["issue_count"] >= 1
+
+    def test_deprecate_emits_contract_deprecated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        c, captured = self._emit_capture(monkeypatch)
+        try:
+            c.post("/contracts", json={"contract": _contract()})
+            captured.clear()
+            r = c.post(
+                "/contracts/users.daily_active/versions/1.0.0/deprecate",
+                json={"deprecation_uri": "https://wiki/migrate"},
+            )
+            assert r.status_code == 200
+        finally:
+            c.__exit__(None, None, None)
+        assert any(e["kind"] == "contract_deprecated" for e in captured)
+        evt = next(e for e in captured if e["kind"] == "contract_deprecated")
+        assert evt["payload"]["deprecation_uri"] == "https://wiki/migrate"
+
+    def test_no_emit_when_audit_stream_url_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("AUDIT_STREAM_URL", raising=False)
+        captured: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(201)
+
+        c = TestClient(app)
+        c.__enter__()
+        try:
+            app.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            r = c.post("/contracts", json={"contract": _contract()})
+            assert r.status_code == 201
+        finally:
+            c.__exit__(None, None, None)
+        assert captured == []
