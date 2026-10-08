@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Schema registry for data contracts.** Semver versioning, compatibility checks (backward / forward / full), declared owners, freshness SLAs. The "you can't promote a new dataset version without an approved contract" pattern, lifted from API governance and aimed at data pipelines.
+**In-memory reference registry for data contracts.** Semver version history, compatibility reports (backward / forward / full), declared owners, and freshness SLAs. It does not authenticate callers, approve contracts, persist state across restarts, or prove that downstream readers accept every row.
 
 The headline endpoint is `POST /contracts` — register a new version, get back a deterministic compatibility report or a 422 with every breaking change called out by field name and kind.
 
@@ -16,8 +16,8 @@ The thing that gets data teams paged at 2am isn't a missing test. It's a produce
 
 - **owners** — who do I page when this dataset goes stale
 - **freshness SLA** — when does "stale" become "broken"
-- **primary key** — changing it is a `MAJOR`, not a `MINOR`
-- **enum drift** — adding a value is fine; removing one is a backward-compatibility break
+- **primary key** — changes are flagged regardless of the version bump
+- **enum drift** — narrowing breaks backward checks; widening breaks forward checks
 - **deprecation policy** — flag a version with the URI of the migration plan; don't delete it
 
 This package is the smallest thing that does all of those.
@@ -32,7 +32,7 @@ pip install data-contract-registry
 pip install "data-contract-registry[api]"
 ```
 
-Python 3.11+. Runtime deps: `pydantic` + `PyYAML`.
+Python 3.11+. Runtime deps: `pydantic`, `PyYAML`, and `httpx` for the optional audit sink.
 
 ---
 
@@ -85,19 +85,23 @@ print(report.errors[0].message)        # "field 'ltv' was removed; old data will
 
 | Mode       | Meaning |
 | ---------- | --- |
-| `backward` | New schema can read data produced by the previous schema. **Default.** Consumers upgrade first. |
-| `forward`  | Previous schema can read data produced by the new schema. Producers upgrade first. |
+| `backward` | Checks whether a new schema may reject previous rows. **Default.** Consumers upgrade first. |
+| `forward`  | Checks whether a previous schema may reject new rows. Producers upgrade first. |
 | `full`     | Both. |
-| `none`     | Anything goes. First-time onboarding only. |
+| `none`     | Skip field checks; version and primary-key rules still apply. Use only with a reviewed migration. |
+
+These are conservative schema-promotion rules, not full row validation or a substitute for a consumer test. Optional new fields are permitted by policy; a strict parser may still reject them. Compatibility is checked against the latest registered version, even if it is archived, so versions cannot move backward.
 
 The checks the engine knows how to flag (each carries a structured `kind` so you can build CI gates around specific failures):
 
 | Kind                       | Severity | Mode |
 | -------------------------- | -------- | --- |
 | `field_removed`            | error    | backward |
-| `field_type_changed`       | error    | backward |
-| `field_required_added`     | error    | backward (optional→required) **or** forward (new required field) |
-| `field_enum_shrunk`        | error    | backward |
+| `field_type_changed`       | error    | backward / forward |
+| `field_required_added`     | error    | backward (optional→required or new required field) / forward (new required field) |
+| `field_required_removed`   | error    | forward (required→optional or removed) |
+| `field_enum_shrunk`        | error    | backward (including introducing an enum) |
+| `field_enum_expanded`      | error    | forward (including removing an enum) |
 | `primary_key_changed`      | error    | always |
 | `version_not_increasing`   | error    | always |
 | `owner_missing`            | error    | always |
@@ -108,7 +112,7 @@ The checks the engine knows how to flag (each carries a structured `kind` so you
 
 ```bash
 pip install "data-contract-registry[api]"
-uvicorn data_contract_registry.app:app --port 8090
+uvicorn data_contract_registry.app:app --host 127.0.0.1 --port 8090
 ```
 
 | Method | Path | What it does |
@@ -123,15 +127,17 @@ uvicorn data_contract_registry.app:app --port 8090
 | GET | `/contracts/{ds}/versions/{v}` | One specific version. |
 | POST | `/contracts/{ds}/versions/{v}/deprecate` | Mark deprecated with a migration URI. |
 | POST | `/contracts/{ds}/versions/{v}/archive` | Archive a version (history preserved). |
-| POST | `/contracts/owners/from-decision-card` | **Cross-ecosystem hook** — pull owners out of a Decision Card. |
+| POST | `/contracts/owners/from-decision-card` | **Cross-ecosystem hook** — suggest owner records from Decision Card fields. |
 
-Bundles are held in-memory by default. For restart-safe storage, swap `_BundleStore`'s implementation; the protocol is small.
+Contracts are process-local memory only. Restarts erase them; multiple workers do not share state. No caller authentication, authorization, tenant isolation, approval workflow, rate limiting, or durable audit trail is provided. Keep this reference server on loopback with synthetic or public data. A customer-facing deployment needs an external trust boundary and durable store.
+
+`AUDIT_STREAM_URL` optionally sends best-effort event summaries to the private sink base URL or its exact `/events` endpoint. The URL requires HTTPS except for numeric loopback HTTP addresses. When set, configure `AUDIT_STREAM_TOKEN` with the sink's separate bearer credential (at least 32 visible ASCII characters) from a secret store. Invalid configuration prevents outbound delivery and logs a failure; HTTP errors are logged without the URL or token. Failures do not block writes, and events are not retried or durably queued, so this is not a durable audit record. The event includes dataset ID, version and issue kinds, but omits owner contacts and field-level compatibility messages.
 
 ---
 
 ## The cross-ecosystem hook
 
-The third hook in the portfolio (after `procurement-decision-api` → `policy-as-code-engine` and the Suite → Decision Intelligence bridge). When a buyer approves a vendor whose data product the team will consume, the Decision Card's `buyer.name` + `decision_maker` are **the right answer** to "who owns the contract on our side":
+The bridge maps `buyer.name` and optional `decision_maker.role/name` to **candidate** owner records. It does not validate the Decision Card, decision status, signatures, buyer identity, or on-call authority. A data steward must confirm the owners and contact before registration. Even a pending, rejected, or withdrawn card can produce the same candidates; the mapping is not an approval gate.
 
 ```bash
 curl -X POST http://localhost:8090/contracts/owners/from-decision-card \
@@ -143,7 +149,7 @@ curl -X POST http://localhost:8090/contracts/owners/from-decision-card \
 # ]
 ```
 
-Drop that list straight into `DataContract.owners` and the registration carries paging info the team didn't have to re-type.
+Review and correct that list before putting it into `DataContract.owners`. `decision_maker.authority` describes approval authority and is not treated as a paging contact.
 
 ---
 
@@ -164,7 +170,7 @@ fields:
   - {name: plan,         type: string, enum: [free, pro, enterprise]}
 ```
 
-Hand-author in YAML, validate in CI, register from Python:
+Hand-author in YAML, validate in CI, register from Python. The matching [serialized JSON fixture](examples/contract.json) is an exported `DataContract` that `csv-data-quality-rs` can consume. The separately reviewed `sql-contract-enforcer` adapter, when present in the selected SQL package version, maps a strict subset of this v0.2 JSON shape into a **proposal** for its different SQL model. The adapter is not part of this package, rejects unsupported semantics, and has not executed DDL against a target engine. A [number enum fixture](examples/contract-number-enum.json) demonstrates finite fractional values in the registry shape:
 
 ```python
 import yaml
@@ -181,7 +187,7 @@ ContractRegistry().register(DataContract.model_validate(raw))
 
 ```bash
 pip install -e ".[dev]"
-ruff check src tests && ruff format --check src tests
+ruff check src tests scripts && ruff format --check src tests scripts
 mypy src
 pytest -v
 ```
@@ -193,7 +199,7 @@ CI matrix runs Python 3.11 / 3.12 / 3.13.
 ## Related in this ecosystem
 
 - **[procurement-decision-api](https://github.com/mizcausevic-dev/procurement-decision-api)** — drafts the Decision Cards this registry pulls owners from.
-- **[policy-as-code-engine](https://github.com/mizcausevic-dev/policy-as-code-engine)** — pair with this registry to enforce contracts at request time.
+- **[policy-as-code-engine](https://github.com/mizcausevic-dev/policy-as-code-engine)** — a separate Decision Card policy prototype; no DataContract enforcement integration is verified here.
 - **[slo-budget-tracker](https://github.com/mizcausevic-dev/slo-budget-tracker)** — wire your freshness SLA into the same monitoring story.
 - More at [kineticgain.com](https://kineticgain.com/).
 

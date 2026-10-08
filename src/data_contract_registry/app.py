@@ -22,7 +22,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from . import __version__, audit_stream
 from .compatibility import CompatibilityMode
@@ -37,7 +37,7 @@ class _RegisterRequest(BaseModel):
 
 
 class _DeprecateRequest(BaseModel):
-    deprecation_uri: str
+    deprecation_uri: str = Field(..., min_length=1, max_length=2048)
 
 
 @asynccontextmanager
@@ -59,8 +59,9 @@ app = FastAPI(
     version=__version__,
     description=(
         "Schema registry for data contracts: semver, compatibility checks, "
-        "ownership, freshness SLAs. Bridges to procurement-decision-api via "
-        "POST /contracts/owners/from-decision-card."
+        "ownership, freshness SLAs. The Decision Card bridge suggests owner "
+        "records for human confirmation; it does not verify approval. "
+        "Reference-only, in-memory API without caller authentication."
     ),
     lifespan=_lifespan,
 )
@@ -69,14 +70,16 @@ app = FastAPI(
 def _registry() -> ContractRegistry:
     """Typed accessor so mypy strict doesn't choke on app.state."""
     registry = app.state.registry
-    assert isinstance(registry, ContractRegistry)
+    if not isinstance(registry, ContractRegistry):
+        raise RuntimeError("registry was not initialized")
     return registry
 
 
 def _http_client() -> httpx.AsyncClient:
     """Shared httpx client used by audit_stream.emit (best-effort)."""
     client = app.state.http_client
-    assert isinstance(client, httpx.AsyncClient)
+    if not isinstance(client, httpx.AsyncClient):
+        raise RuntimeError("HTTP client was not initialized")
     return client
 
 
@@ -100,7 +103,7 @@ async def root() -> dict[str, Any]:
             "GET  /contracts/{ds}/versions/{v}": "one specific version",
             "POST /contracts/{ds}/versions/{v}/deprecate": "mark a version deprecated",
             "POST /contracts/{ds}/versions/{v}/archive": "archive a version",
-            "POST /contracts/owners/from-decision-card": "Decision Card -> Owner list",
+            "POST /contracts/owners/from-decision-card": "Decision Card -> candidate Owner list",
         },
     }
 
@@ -131,11 +134,11 @@ async def register_contract(req: _RegisterRequest) -> dict[str, Any]:
                 "version": req.contract.version,
                 "mode": report.mode,
                 "issue_count": len(report.issues),
-                "issues": [i.model_dump(mode="json") for i in report.issues],
+                "issue_kinds": sorted({issue.kind for issue in report.issues}),
             },
         )
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail={
                 "compatible": False,
                 "mode": report.mode,
@@ -149,7 +152,6 @@ async def register_contract(req: _RegisterRequest) -> dict[str, Any]:
             "dataset_id": req.contract.dataset_id,
             "version": req.contract.version,
             "mode": report.mode,
-            "owners": [o.team for o in req.contract.owners],
         },
     )
     return {
@@ -197,6 +199,8 @@ async def deprecate_version(
 ) -> DataContract:
     try:
         contract = _registry().deprecate(dataset_id, version, deprecation_uri=req.deprecation_uri)
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
     except RegistryError as err:
         raise HTTPException(status_code=404, detail=str(err)) from err
     await audit_stream.emit(
@@ -221,7 +225,7 @@ async def archive_version(dataset_id: str, version: str) -> DataContract:
 
 @app.post("/contracts/owners/from-decision-card", tags=["bridge"])
 async def owners_from_decision_card(card: dict[str, Any]) -> list[Owner]:
-    """The cross-ecosystem hook — pull owners out of a Decision Card."""
+    """Suggest owners from a Decision Card; caller must confirm authority."""
     try:
         return contract_owner_from_decision_card(card)
     except (ValueError, ValidationError) as err:

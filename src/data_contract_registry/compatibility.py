@@ -12,24 +12,27 @@ Modes follow the Confluent schema registry conventions:
 
 For our six-type system the rules are:
 
-    BACKWARD-breaking changes (new schema rejects old data):
+    BACKWARD-breaking changes (new schema may reject old data):
       - removed a field that old data carried
       - changed a field's type
       - turned an optional field into required (old data missing it -> reject)
+      - added a required field (old data missing it -> reject)
+      - introduced an enum on an unrestricted field
       - shrunk an enum (old enum value -> reject)
 
-    FORWARD-breaking changes (old schema rejects new data):
+    FORWARD-breaking changes (old schema may reject new data):
       - added a required field old schema doesn't know about
-        (only matters if old schema rejects unknown fields; we treat additions
-         to enums as forward-compatible since extra values are fine for readers)
+      - removed or made optional a field the old schema required
+      - changed a field's type or widened/removed its enum
 
-This is intentionally smaller than the Avro/Protobuf rule set — the point is
-"can I promote this", not "let me prove every possible serialisation path."
+These are conservative schema-promotion rules, not proof that a particular CSV
+or SQL reader accepts every row. An optional new field is permitted in both
+directions by policy; downstream parsers may impose stricter rules.
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, cast
 
 from .models import (
     CompatibilityIssue,
@@ -38,6 +41,14 @@ from .models import (
 )
 
 CompatibilityMode = Literal["backward", "forward", "full", "none"]
+VALID_MODES = ("backward", "forward", "full", "none")
+
+
+def validate_mode(mode: str) -> CompatibilityMode:
+    """Reject unknown modes for direct library callers as well as HTTP callers."""
+    if mode not in VALID_MODES:
+        raise ValueError(f"unknown compatibility mode: {mode!r}")
+    return cast(CompatibilityMode, mode)
 
 
 class CompatibilityChecker:
@@ -50,6 +61,7 @@ class CompatibilityChecker:
         *,
         mode: CompatibilityMode = "backward",
     ) -> CompatibilityReport:
+        mode = validate_mode(mode)
         if previous.dataset_id != proposed.dataset_id:
             raise ValueError(
                 f"dataset_id mismatch: previous={previous.dataset_id!r} proposed={proposed.dataset_id!r}"
@@ -64,6 +76,17 @@ class CompatibilityChecker:
             issues.extend(self._backward_issues(previous, proposed))
         if mode in ("forward", "full"):
             issues.extend(self._forward_issues(previous, proposed))
+
+        # A type change breaks both directions, but should appear once in a
+        # full-mode report. Preserve the first message for stable diagnostics.
+        unique: list[CompatibilityIssue] = []
+        seen: set[tuple[str, str | None]] = set()
+        for issue in issues:
+            key = (issue.kind, issue.field)
+            if key not in seen:
+                unique.append(issue)
+                seen.add(key)
+        issues = unique
 
         compatible = not any(i.severity == "error" for i in issues)
         return CompatibilityReport(compatible=compatible, mode=mode, issues=issues)
@@ -152,23 +175,32 @@ class CompatibilityChecker:
                         message=(f"field {name!r} was optional, now required; old rows missing it will fail"),
                     )
                 )
-            if prev.enum and new.enum and set(new.enum) - set(prev.enum) != set(new.enum) - set(prev.enum):
-                # Should never happen; guard kept for clarity.
-                pass
-            if prev.enum and new.enum:
-                shrunk = set(prev.enum) - set(new.enum)
-                if shrunk:
+            if new.enum is not None:
+                removed = set(prev.enum) - set(new.enum) if prev.enum is not None else set()
+                if prev.enum is None or removed:
                     issues.append(
                         CompatibilityIssue(
                             severity="error",
                             field=name,
                             kind="field_enum_shrunk",
                             message=(
-                                f"field {name!r} enum shrunk; removed values {sorted(map(str, shrunk))} "
-                                "may appear in old data"
+                                f"field {name!r} now restricts values to an enum"
+                                if prev.enum is None
+                                else f"field {name!r} enum removed previously allowed values"
                             ),
                         )
                     )
+
+        for name, new in new_fields.items():
+            if name not in prev_fields and new.required:
+                issues.append(
+                    CompatibilityIssue(
+                        severity="error",
+                        field=name,
+                        kind="field_required_added",
+                        message=f"required field {name!r} added; old rows may lack it",
+                    )
+                )
         return issues
 
     def _forward_issues(self, previous: DataContract, proposed: DataContract) -> list[CompatibilityIssue]:
@@ -187,6 +219,46 @@ class CompatibilityChecker:
                             f"required field {name!r} added; consumers on the old schema "
                             "won't know how to populate it"
                         ),
+                    )
+                )
+            if name not in prev_fields:
+                continue
+            prev = prev_fields[name]
+            if new.type != prev.type:
+                issues.append(
+                    CompatibilityIssue(
+                        severity="error",
+                        field=name,
+                        kind="field_type_changed",
+                        message=f"field {name!r} type changed: {prev.type} -> {new.type}",
+                    )
+                )
+            if prev.required and not new.required:
+                issues.append(
+                    CompatibilityIssue(
+                        severity="error",
+                        field=name,
+                        kind="field_required_removed",
+                        message=f"field {name!r} is now optional; new rows may omit it",
+                    )
+                )
+            if prev.enum is not None and (new.enum is None or set(new.enum) - set(prev.enum)):
+                issues.append(
+                    CompatibilityIssue(
+                        severity="error",
+                        field=name,
+                        kind="field_enum_expanded",
+                        message=f"field {name!r} may now contain values rejected by the old enum",
+                    )
+                )
+        for name, prev in prev_fields.items():
+            if name not in new_fields and prev.required:
+                issues.append(
+                    CompatibilityIssue(
+                        severity="error",
+                        field=name,
+                        kind="field_required_removed",
+                        message=f"required field {name!r} was removed; old readers may require it",
                     )
                 )
         return issues

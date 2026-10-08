@@ -32,6 +32,24 @@ class TestOwnersFromDecisionCard:
         assert "Director of Data" in owners[1].team
         assert "Alex Chen" in owners[1].team
 
+    def test_authority_is_not_treated_as_paging_contact(self) -> None:
+        card = _card()
+        card["decision_maker"] = {
+            "role": "Director of Data",
+            "name": "Alex Chen",
+            "authority": "Delegated purchasing authority",
+        }
+        owners = contract_owner_from_decision_card(card)
+        assert owners[1].contact is None
+
+    @pytest.mark.parametrize("status", ["pending", "rejected", "withdrawn"])
+    def test_decision_status_does_not_turn_candidates_into_approval(self, status: str) -> None:
+        card = _card()
+        card["decision"] = {"status": status}
+        # This helper maps fields only. Registration and a data steward must
+        # independently decide whether these are the actual owner records.
+        assert contract_owner_from_decision_card(card)[0].team == "Springfield USD"
+
     def test_no_decision_maker_yields_only_buyer(self) -> None:
         card = _card()
         del card["decision_maker"]
@@ -49,4 +67,27 @@ class TestOwnersFromDecisionCard:
         card = _card()
         card["buyer"] = {"type": "school-district"}
         with pytest.raises(ValueError, match=r"buyer\.name"):
+            contract_owner_from_decision_card(card)
+
+    def test_whitespace_buyer_name_raises(self) -> None:
+        card = _card()
+        card["buyer"] = {"name": "   "}
+        with pytest.raises(ValueError, match=r"buyer\.name"):
+            contract_owner_from_decision_card(card)
+
+    def test_whitespace_contact_is_not_a_paging_contact(self) -> None:
+        card = _card()
+        card["buyer"] = {"name": "Springfield USD", "contact": "  "}
+        assert contract_owner_from_decision_card(card)[0].contact is None
+
+    def test_whitespace_decision_maker_role_raises(self) -> None:
+        card = _card()
+        card["decision_maker"] = {"role": "  "}
+        with pytest.raises(ValueError, match=r"decision_maker\.role"):
+            contract_owner_from_decision_card(card)
+
+    def test_invalid_decision_maker_shape_raises(self) -> None:
+        card = _card()
+        card["decision_maker"] = "Director of Data"
+        with pytest.raises(ValueError, match="decision_maker"):
             contract_owner_from_decision_card(card)

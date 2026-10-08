@@ -15,12 +15,13 @@ Versions are full snapshots (not diffs); the registry holds the version history.
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+SEMVER_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 
 
 class StrictModel(BaseModel):
@@ -40,11 +41,34 @@ class DataField(StrictModel):
     type: FieldType
     required: bool = True
     description: str | None = None
-    enum: list[str | int | bool] | None = Field(
+    enum: list[str | int | float | bool] | None = Field(
         default=None,
         description="If set, the field value must be one of these.",
     )
     deprecated: bool = False
+
+    @model_validator(mode="after")
+    def _check_enum(self) -> DataField:
+        if not self.name.strip():
+            raise ValueError("field name must not be blank")
+        if self.enum is None:
+            return self
+        if not self.enum:
+            raise ValueError("enum must contain at least one value")
+        if self.type in ("timestamp", "json"):
+            raise ValueError(f"enum is not supported for {self.type} fields")
+        for value in self.enum:
+            valid = (
+                (self.type == "string" and type(value) is str)
+                or (self.type == "integer" and type(value) is int)
+                or (self.type == "number" and type(value) in (int, float))
+                or (self.type == "boolean" and type(value) is bool)
+            )
+            if not valid or (type(value) is float and not math.isfinite(value)):
+                raise ValueError(f"enum values must match field type {self.type}")
+        if len(set(self.enum)) != len(self.enum):
+            raise ValueError("enum values must be unique")
+        return self
 
 
 class Owner(StrictModel):
@@ -55,6 +79,14 @@ class Owner(StrictModel):
         default=None,
         description="Slack channel, pager group, or email.",
     )
+
+    @model_validator(mode="after")
+    def _check_owner(self) -> Owner:
+        if not self.team.strip():
+            raise ValueError("owner team must not be blank")
+        if self.contact is not None and not self.contact.strip():
+            raise ValueError("owner contact must not be blank")
+        return self
 
 
 class FreshnessSLA(StrictModel):
@@ -71,15 +103,15 @@ class DataContract(StrictModel):
     """
     The whole contract document.
 
-    Stable identity is `(dataset_id, version)`. Versions follow semver:
+    Stable identity is `(dataset_id, version)`. Version numbers use semver:
 
-        MAJOR   incompatible change (removed field, renamed field, type change)
+        MAJOR   indicates an incompatible change, but does not bypass checks
         MINOR   new optional field, new enum value
         PATCH   description fix, owner update, no schema change
     """
 
     dataset_id: str = Field(..., min_length=1, max_length=128)
-    version: str = Field(..., description="Semver like '1.2.0'.")
+    version: str = Field(..., max_length=64, description="Semver like '1.2.0'.")
     description: str | None = None
     fields: list[DataField] = Field(..., min_length=1)
     owners: list[Owner] = Field(..., min_length=1)
@@ -90,15 +122,22 @@ class DataContract(StrictModel):
 
     @model_validator(mode="after")
     def _check_invariants(self) -> DataContract:
+        if not self.dataset_id.strip():
+            raise ValueError("dataset_id must not be blank")
         if not SEMVER_RE.match(self.version):
             raise ValueError(f"version must match MAJOR.MINOR.PATCH; got {self.version!r}")
         names = [f.name for f in self.fields]
         if len(names) != len(set(names)):
             raise ValueError("field names must be unique within a contract")
+        fields_by_name = {field.name: field for field in self.fields}
         for key in self.primary_key:
-            if key not in names:
+            if key not in fields_by_name:
                 raise ValueError(f"primary_key field {key!r} is not declared in fields")
-        if self.status == "deprecated" and not self.deprecation_uri:
+            if not fields_by_name[key].required:
+                raise ValueError(f"primary_key field {key!r} must be required")
+        if len(self.primary_key) != len(set(self.primary_key)):
+            raise ValueError("primary_key fields must be unique")
+        if self.status == "deprecated" and not (self.deprecation_uri or "").strip():
             raise ValueError("status='deprecated' requires deprecation_uri")
         return self
 
@@ -124,7 +163,9 @@ class CompatibilityIssue(StrictModel):
         "field_renamed",
         "field_type_changed",
         "field_required_added",
+        "field_required_removed",
         "field_enum_shrunk",
+        "field_enum_expanded",
         "version_not_increasing",
         "owner_missing",
         "primary_key_changed",

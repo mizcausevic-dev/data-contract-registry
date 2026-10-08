@@ -118,6 +118,14 @@ class TestDeprecateAndArchive:
         assert r.status_code == 200
         assert r.json()["status"] == "deprecated"
 
+    def test_deprecate_blank_uri_is_400(self, client: TestClient) -> None:
+        client.post("/contracts", json={"contract": _contract()})
+        response = client.post(
+            "/contracts/users.daily_active/versions/1.0.0/deprecate",
+            json={"deprecation_uri": "  "},
+        )
+        assert response.status_code == 400
+
     def test_archive(self, client: TestClient) -> None:
         client.post("/contracts", json={"contract": _contract()})
         r = client.post("/contracts/users.daily_active/versions/1.0.0/archive")
@@ -166,13 +174,15 @@ class TestBridge:
 
 class TestAuditStreamWiring:
     """The three endpoints that emit governance events must do so when
-    AUDIT_STREAM_URL is set, and stay silent when it isn't."""
+    AUDIT_STREAM_URL and AUDIT_STREAM_TOKEN are set, and stay silent when disabled."""
 
     def _emit_capture(self, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, list[dict[str, Any]]]:
-        monkeypatch.setenv("AUDIT_STREAM_URL", "http://audit.local")
+        monkeypatch.setenv("AUDIT_STREAM_URL", "https://audit.local")
+        monkeypatch.setenv("AUDIT_STREAM_TOKEN", "a" * 32)
         captured: list[dict[str, Any]] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers["Authorization"] == f"Bearer {'a' * 32}"
             captured.append(json.loads(request.content.decode("utf-8")))
             return httpx.Response(201, json={"event_id": len(captured)})
 
@@ -193,7 +203,7 @@ class TestAuditStreamWiring:
         assert evt["source"] == "data-contract-registry"
         assert evt["payload"]["dataset_id"] == "users.daily_active"
         assert evt["payload"]["version"] == "1.0.0"
-        assert "growth-platform" in evt["payload"]["owners"]
+        assert "owners" not in evt["payload"]
 
     def test_incompatible_register_emits_compatibility_failed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         c, captured = self._emit_capture(monkeypatch)
@@ -215,6 +225,8 @@ class TestAuditStreamWiring:
         assert evt["payload"]["dataset_id"] == "users.daily_active"
         assert evt["payload"]["version"] == "2.0.0"
         assert evt["payload"]["issue_count"] >= 1
+        assert "issues" not in evt["payload"]
+        assert "field_removed" in evt["payload"]["issue_kinds"]
 
     def test_deprecate_emits_contract_deprecated(self, monkeypatch: pytest.MonkeyPatch) -> None:
         c, captured = self._emit_capture(monkeypatch)
