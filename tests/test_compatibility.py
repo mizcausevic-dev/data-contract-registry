@@ -82,6 +82,21 @@ class TestBackwardCompatibility:
         report = CompatibilityChecker().check(prev, new, mode="backward")
         assert report.compatible
 
+    def test_adding_required_field_breaks_backward(self) -> None:
+        prev = make_contract()
+        new = make_contract(
+            version="1.1.0",
+            fields=[*prev.fields, DataField(name="required_new", type="string")],
+        )
+        report = CompatibilityChecker().check(prev, new, mode="backward")
+        assert any(i.field == "required_new" and i.kind == "field_required_added" for i in report.errors)
+
+    def test_introducing_enum_breaks_backward(self) -> None:
+        prev = make_contract()
+        fields = [f.model_copy(update={"enum": [1, 2]}) if f.name == "ltv" else f for f in prev.fields]
+        report = CompatibilityChecker().check(prev, make_contract(version="1.1.0", fields=fields))
+        assert any(i.field == "ltv" and i.kind == "field_enum_shrunk" for i in report.errors)
+
     def test_expanding_an_enum_is_backward_compatible(self) -> None:
         prev = make_contract(version="1.0.0")
         new_fields = []
@@ -112,6 +127,41 @@ class TestForwardCompatibility:
         report = CompatibilityChecker().check(prev, new, mode="forward")
         assert report.compatible
 
+    def test_removing_required_field_breaks_forward(self) -> None:
+        prev = make_contract()
+        fields = [f for f in prev.fields if f.name != "plan"]
+        report = CompatibilityChecker().check(
+            prev, make_contract(version="2.0.0", fields=fields), mode="forward"
+        )
+        assert any(i.field == "plan" and i.kind == "field_required_removed" for i in report.errors)
+
+    def test_making_required_field_optional_breaks_forward(self) -> None:
+        prev = make_contract()
+        fields = [f.model_copy(update={"required": False}) if f.name == "plan" else f for f in prev.fields]
+        report = CompatibilityChecker().check(
+            prev, make_contract(version="2.0.0", fields=fields), mode="forward"
+        )
+        assert any(i.field == "plan" and i.kind == "field_required_removed" for i in report.errors)
+
+    def test_expanding_enum_breaks_forward(self) -> None:
+        prev = make_contract()
+        fields = [
+            f.model_copy(update={"enum": ["free", "pro", "enterprise", "team"]}) if f.name == "plan" else f
+            for f in prev.fields
+        ]
+        report = CompatibilityChecker().check(
+            prev, make_contract(version="1.1.0", fields=fields), mode="forward"
+        )
+        assert any(i.field == "plan" and i.kind == "field_enum_expanded" for i in report.errors)
+
+    def test_type_change_breaks_forward(self) -> None:
+        prev = make_contract()
+        fields = [f.model_copy(update={"type": "string"}) if f.name == "ltv" else f for f in prev.fields]
+        report = CompatibilityChecker().check(
+            prev, make_contract(version="2.0.0", fields=fields), mode="forward"
+        )
+        assert any(i.field == "ltv" and i.kind == "field_type_changed" for i in report.errors)
+
 
 class TestFullAndNoneModes:
     def test_full_combines_backward_and_forward(self) -> None:
@@ -132,3 +182,9 @@ class TestDatasetIdMismatch:
         new = make_contract(dataset_id="users.something_else", version="2.0.0")
         with pytest.raises(ValueError, match="dataset_id mismatch"):
             CompatibilityChecker().check(prev, new)
+
+
+def test_unknown_mode_fails_closed_for_library_caller() -> None:
+    checker = CompatibilityChecker()
+    with pytest.raises(ValueError, match="unknown compatibility mode"):
+        checker.check(make_contract(), make_contract(version="2.0.0"), mode="typo")  # type: ignore[arg-type]

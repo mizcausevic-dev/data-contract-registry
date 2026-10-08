@@ -22,12 +22,16 @@ Identical config envvars.
 
 from __future__ import annotations
 
+import logging
+import math
 import os
 from typing import Any
 
 import httpx
 
 DEFAULT_TIMEOUT_S = 2.5
+MAX_TIMEOUT_S = 10.0
+logger = logging.getLogger(__name__)
 
 
 def is_enabled() -> bool:
@@ -49,9 +53,12 @@ def timeout_s() -> float:
     if not raw:
         return DEFAULT_TIMEOUT_S
     try:
-        return max(0.1, float(raw))
+        value = float(raw)
     except ValueError:
         return DEFAULT_TIMEOUT_S
+    if not math.isfinite(value):
+        return DEFAULT_TIMEOUT_S
+    return min(MAX_TIMEOUT_S, max(0.1, value))
 
 
 async def emit(
@@ -78,7 +85,6 @@ async def emit(
         )
         response.raise_for_status()
     except (httpx.HTTPError, OSError) as err:
-        print(
-            f"audit-stream emit failed (kind={kind}): {type(err).__name__}: {err}",
-            flush=True,
-        )
+        # Exception strings can contain URLs and credentials from the
+        # operator-supplied sink URL. Log only the event kind and error class.
+        logger.warning("audit-stream emit failed (kind=%s; error=%s)", kind, type(err).__name__)

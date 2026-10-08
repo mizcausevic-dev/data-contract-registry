@@ -43,6 +43,15 @@ class TestConfig:
         monkeypatch.setenv("AUDIT_STREAM_TIMEOUT_S", "not-a-number")
         assert audit_stream.timeout_s() == audit_stream.DEFAULT_TIMEOUT_S
 
+    @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+    def test_timeout_nonfinite_value_falls_back(self, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+        monkeypatch.setenv("AUDIT_STREAM_TIMEOUT_S", value)
+        assert audit_stream.timeout_s() == audit_stream.DEFAULT_TIMEOUT_S
+
+    def test_timeout_is_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AUDIT_STREAM_TIMEOUT_S", "86400")
+        assert audit_stream.timeout_s() == audit_stream.MAX_TIMEOUT_S
+
 
 class TestEmit:
     @pytest.mark.asyncio
@@ -108,12 +117,12 @@ class TestEmit:
         assert captured[0]["payload"]["deprecation_uri"] == "https://wiki/migrate"
 
     @pytest.mark.asyncio
-    async def test_emit_swallows_server_error_silently(
+    async def test_emit_swallows_server_error_without_logging_url(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        monkeypatch.setenv("AUDIT_STREAM_URL", "http://audit.local/")
+        monkeypatch.setenv("AUDIT_STREAM_URL", "http://private-token@audit.local/")
 
         def handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(500)
@@ -122,10 +131,9 @@ class TestEmit:
         async with httpx.AsyncClient(transport=transport) as client:
             # Must not raise.
             await audit_stream.emit(client, kind="contract_promoted", payload={})
-        out = capsys.readouterr().out
-        # Some error message was logged; specific text isn't asserted to keep
-        # the test resilient to format tweaks.
-        assert "audit-stream emit failed" in out or True
+        assert "audit-stream emit failed" in caplog.text
+        assert "private-token" not in caplog.text
+        assert "http://" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_emit_swallows_connection_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "data-contract-registry"
-version = "0.1.1"
-description = "Schema registry for data contracts: semver versioning, compatibility checks (backward/forward/full), ownership, freshness SLAs. The 'you can't promote it without an approved contract' pattern for data pipelines. Optional audit-stream-py integration via AUDIT_STREAM_URL."
+version = "0.2.0"
+description = "In-memory reference registry for data contracts with semver history, compatibility reports, ownership, and freshness SLAs. Optional best-effort audit events."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
@@ -57,6 +57,9 @@ Issues        = "https://github.com/mizcausevic-dev/data-contract-registry/issue
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/data_contract_registry"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src", "tests", "examples", "README.md", "LICENSE", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -26,6 +26,15 @@ class TestFirstRegistration:
         with pytest.raises(RegistryError):
             r.get("nope", "1.0.0")
 
+    def test_unknown_mode_cannot_bypass_first_registration_or_dry_run(self) -> None:
+        r = ContractRegistry()
+        contract = make_contract()
+        with pytest.raises(ValueError, match="unknown compatibility mode"):
+            r.register(contract, compatibility="typo")  # type: ignore[arg-type]
+        assert r.datasets() == []
+        with pytest.raises(ValueError, match="unknown compatibility mode"):
+            r.check(contract, compatibility="typo")  # type: ignore[arg-type]
+
 
 class TestPromotion:
     def test_compatible_promotion_succeeds(self) -> None:
@@ -54,6 +63,37 @@ class TestPromotion:
         with pytest.raises(RegistryError, match="already registered"):
             r.register(make_contract(version="1.0.0"))
 
+    def test_archived_latest_still_sets_version_floor_and_matches_dry_run(self) -> None:
+        r = ContractRegistry()
+        r.register(make_contract(version="1.0.0"))
+        r.register(make_contract(version="1.1.0"))
+        r.archive("users.daily_active", "1.1.0")
+        proposed = make_contract(version="1.0.5")
+
+        dry_run = r.check(proposed)
+        actual = r.register(proposed)
+        assert not dry_run.compatible
+        assert dry_run == actual
+        assert any(i.kind == "version_not_increasing" for i in actual.errors)
+        assert [c.version for c in r.history("users.daily_active")] == ["1.0.0", "1.1.0"]
+
+    def test_caller_cannot_mutate_registered_history(self) -> None:
+        r = ContractRegistry()
+        original = make_contract()
+        r.register(original)
+        original.fields[0].name = "tampered_input"
+        from_get = r.get("users.daily_active", "1.0.0")
+        from_get.fields[0].name = "tampered_get"
+        from_history = r.history("users.daily_active")
+        from_history[0].owners[0].team = "tampered_history"
+        from_latest = r.latest("users.daily_active")
+        from_latest.primary_key.append("ltv")
+
+        stored = r.get("users.daily_active", "1.0.0")
+        assert stored.fields[0].name == "user_id"
+        assert stored.owners[0].team == "growth-platform"
+        assert stored.primary_key == ["user_id", "active_date"]
+
 
 class TestDeprecateAndArchive:
     def test_deprecate_marks_status_and_uri(self) -> None:
@@ -62,6 +102,16 @@ class TestDeprecateAndArchive:
         updated = r.deprecate("users.daily_active", "1.0.0", deprecation_uri="https://wiki/x")
         assert updated.status == "deprecated"
         assert updated.deprecation_uri == "https://wiki/x"
+
+    def test_rejects_blank_deprecation_uri_and_archived_revival(self) -> None:
+        r = ContractRegistry()
+        r.register(make_contract())
+        with pytest.raises(ValueError, match="deprecation_uri"):
+            r.deprecate("users.daily_active", "1.0.0", deprecation_uri="  ")
+        r.archive("users.daily_active", "1.0.0")
+        with pytest.raises(ValueError, match="archived"):
+            r.deprecate("users.daily_active", "1.0.0", deprecation_uri="https://wiki/x")
+        assert r.get("users.daily_active", "1.0.0").status == "archived"
 
     def test_archive_marks_status(self) -> None:
         r = ContractRegistry()

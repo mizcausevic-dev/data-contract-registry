@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from threading import Lock
 
-from .compatibility import CompatibilityChecker, CompatibilityMode
+from .compatibility import CompatibilityChecker, CompatibilityMode, validate_mode
 from .models import CompatibilityReport, DataContract
 
 
@@ -51,19 +51,18 @@ class ContractRegistry:
         If there's no existing version for this `dataset_id`, the contract is
         accepted unconditionally (a compatible-by-vacuous-truth report is returned).
 
-        If there is, the new version is checked against the most recent active
-        version. The registration only proceeds if the report's `compatible` is
-        True.
+        If there is, the new version is checked against the most recently
+        registered version, including deprecated or archived versions. This
+        keeps version history strictly increasing. The registration only
+        proceeds if the report's `compatible` is True.
         """
+        compatibility = validate_mode(compatibility)
         with self._lock:
             history = self._contracts.setdefault(contract.dataset_id, [])
-            existing = next((c for c in reversed(history) if c.status == "active"), None)
-            if existing is None and history:
-                # Fall back to the most recent of any status.
-                existing = history[-1]
+            existing = history[-1] if history else None
 
             if existing is None:
-                history.append(contract)
+                history.append(contract.model_copy(deep=True))
                 return CompatibilityReport(compatible=True, mode=compatibility, issues=[])
 
             if existing.version == contract.version:
@@ -75,7 +74,7 @@ class ContractRegistry:
             if not report.compatible:
                 return report
 
-            history.append(contract)
+            history.append(contract.model_copy(deep=True))
             return report
 
     def deprecate(
@@ -85,17 +84,21 @@ class ContractRegistry:
         *,
         deprecation_uri: str,
     ) -> DataContract:
+        if not deprecation_uri.strip():
+            raise ValueError("deprecation_uri must not be blank")
         with self._lock:
             history = self._contracts.get(dataset_id)
             if not history:
                 raise RegistryError(f"unknown dataset_id: {dataset_id!r}")
             for i, c in enumerate(history):
                 if c.version == version:
+                    if c.status == "archived":
+                        raise ValueError("archived versions cannot be deprecated")
                     updated = c.model_copy(
-                        update={"status": "deprecated", "deprecation_uri": deprecation_uri}
+                        deep=True, update={"status": "deprecated", "deprecation_uri": deprecation_uri}
                     )
                     history[i] = updated
-                    return updated
+                    return updated.model_copy(deep=True)
             raise RegistryError(f"{dataset_id!r} has no version {version!r}")
 
     def archive(self, dataset_id: str, version: str) -> DataContract:
@@ -105,9 +108,9 @@ class ContractRegistry:
                 raise RegistryError(f"unknown dataset_id: {dataset_id!r}")
             for i, c in enumerate(history):
                 if c.version == version:
-                    updated = c.model_copy(update={"status": "archived"})
+                    updated = c.model_copy(deep=True, update={"status": "archived"})
                     history[i] = updated
-                    return updated
+                    return updated.model_copy(deep=True)
             raise RegistryError(f"{dataset_id!r} has no version {version!r}")
 
     # ---- reads ----------------------------------------------------------
@@ -118,10 +121,10 @@ class ContractRegistry:
             if not history:
                 raise RegistryError(f"unknown dataset_id: {dataset_id!r}")
             if include_non_active:
-                return history[-1]
+                return history[-1].model_copy(deep=True)
             for c in reversed(history):
                 if c.status == "active":
-                    return c
+                    return c.model_copy(deep=True)
             raise RegistryError(f"{dataset_id!r} has no active version")
 
     def get(self, dataset_id: str, version: str) -> DataContract:
@@ -131,7 +134,7 @@ class ContractRegistry:
                 raise RegistryError(f"unknown dataset_id: {dataset_id!r}")
             for c in history:
                 if c.version == version:
-                    return c
+                    return c.model_copy(deep=True)
             raise RegistryError(f"{dataset_id!r} has no version {version!r}")
 
     def history(self, dataset_id: str) -> list[DataContract]:
@@ -139,7 +142,7 @@ class ContractRegistry:
             history = self._contracts.get(dataset_id)
             if not history:
                 raise RegistryError(f"unknown dataset_id: {dataset_id!r}")
-            return list(history)
+            return [contract.model_copy(deep=True) for contract in history]
 
     def datasets(self) -> list[str]:
         with self._lock:
@@ -158,9 +161,10 @@ class ContractRegistry:
         compatibility: CompatibilityMode = "backward",
     ) -> CompatibilityReport:
         """Check a proposed contract WITHOUT registering it."""
+        compatibility = validate_mode(compatibility)
         with self._lock:
             history = self._contracts.get(contract.dataset_id)
-            existing = next((c for c in reversed(history or []) if c.status == "active"), None)
+            existing = history[-1] if history else None
         if existing is None:
             return CompatibilityReport(compatible=True, mode=compatibility, issues=[])
         return self._checker.check(existing, contract, mode=compatibility)
