@@ -131,7 +131,7 @@ uvicorn data_contract_registry.app:app --host 127.0.0.1 --port 8090
 
 Contracts are process-local memory only. Restarts erase them; multiple workers do not share state. No caller authentication, authorization, tenant isolation, approval workflow, rate limiting, or durable audit trail is provided. Keep this reference server on loopback with synthetic or public data. A customer-facing deployment needs an external trust boundary and durable store.
 
-`AUDIT_STREAM_URL` optionally sends best-effort event summaries to the private sink base URL or its exact `/events` endpoint. When set, configure `AUDIT_STREAM_TOKEN` with the sink's separate bearer credential (at least 32 visible ASCII characters) from a secret store. Invalid configuration prevents outbound delivery and logs a failure; HTTP errors are logged without the URL or token. Failures do not block writes, and events are not retried or durably queued, so this is not a durable audit record. The event includes dataset ID, version and issue kinds, but omits owner contacts and field-level compatibility messages.
+`AUDIT_STREAM_URL` optionally sends best-effort event summaries to the private sink base URL or its exact `/events` endpoint. The URL requires HTTPS except for numeric loopback HTTP addresses. When set, configure `AUDIT_STREAM_TOKEN` with the sink's separate bearer credential (at least 32 visible ASCII characters) from a secret store. Invalid configuration prevents outbound delivery and logs a failure; HTTP errors are logged without the URL or token. Failures do not block writes, and events are not retried or durably queued, so this is not a durable audit record. The event includes dataset ID, version and issue kinds, but omits owner contacts and field-level compatibility messages.
 
 ---
 
