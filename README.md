@@ -170,7 +170,7 @@ fields:
   - {name: plan,         type: string, enum: [free, pro, enterprise]}
 ```
 
-Hand-author in YAML, validate in CI, register from Python. The matching [serialized JSON fixture](examples/contract.json) is an exported `DataContract` that `csv-data-quality-rs` can consume. `sql-contract-enforcer` uses a different JSON model and needs an explicit, tested mapping before it can consume registry contracts. A [number enum fixture](examples/contract-number-enum.json) demonstrates finite fractional values in the registry shape:
+Hand-author in YAML, validate in CI, register from Python. The matching [serialized JSON fixture](examples/contract.json) is an exported `DataContract` that `csv-data-quality-rs` can consume. The separately reviewed `sql-contract-enforcer` adapter, when present in the selected SQL package version, maps a strict subset of this v0.2 JSON shape into a **proposal** for its different SQL model. The adapter is not part of this package, rejects unsupported semantics, and has not executed DDL against a target engine. A [number enum fixture](examples/contract-number-enum.json) demonstrates finite fractional values in the registry shape:
 
 ```python
 import yaml
