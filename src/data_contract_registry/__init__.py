@@ -12,10 +12,10 @@ Two surfaces:
 
 Compatibility modes use the conventional direction names:
 
-    BACKWARD      new schema can read data produced by the previous schema
-    FORWARD       previous schema can read data produced by the new schema
-    FULL          both of the above
-    NONE          anything goes (use for first-time onboarding only)
+    BACKWARD      selected checks for new schema rejecting previous rows
+    FORWARD       selected checks for previous schema rejecting new rows
+    FULL          both sets of checks
+    NONE          skip field checks; version, primary-key, and owner rules remain
 """
 
 from __future__ import annotations
